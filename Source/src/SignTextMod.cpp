@@ -4739,6 +4739,10 @@ namespace WindroseTextSigns
             return;
         }
         register_keydown_event(static_cast<Input::Key>(m_hotkey_vk), [this]() {
+            // The lambda just records the press; the open-or-toggle-close decision and any
+            // logging happens in tick_pending_hotkey, which runs on the safe game-tick
+            // context. Keeping side effects (other than atomic stores) out of the keydown
+            // callback mirrors the surrounding RETURN / ESCAPE handlers.
             m_hotkey_requested.store(true);
         });
         register_keydown_event(Input::Key::RETURN, [this]() {
@@ -4753,7 +4757,7 @@ namespace WindroseTextSigns
                 m_phase7_escape_requested.store(true);
             }
         });
-        log_line("[input] Registered hotkeys: " + m_hotkey_name + "=target/open_editor");
+        log_line("[input] Registered hotkeys: " + m_hotkey_name + "=target/open_editor/toggle_close");
     }
 
     auto SignTextMod::install_phase7_keyboard_capture_hook() -> void
@@ -4848,18 +4852,30 @@ namespace WindroseTextSigns
         }
 
         bool input_mode_applied = false;
+        std::string applied_mode_name = "none";
         if (enable_ui_mode)
         {
+            // Prefer UIOnly so the game's Escape -> Main Menu binding is suppressed while the
+            // editor is open. GameAndUI leaks game input through and lets Esc open the pause
+            // menu underneath the editor, which is the user-visible bug.
             input_mode_applied = invoke_no_param(
                 controller,
-                STR("SetInputModeGameAndUI"),
-                STR("/Script/Engine.PlayerController:SetInputModeGameAndUI"));
-            if (!input_mode_applied)
+                STR("SetInputModeUIOnly"),
+                STR("/Script/Engine.PlayerController:SetInputModeUIOnly"));
+            if (input_mode_applied)
+            {
+                applied_mode_name = "UIOnly";
+            }
+            else
             {
                 input_mode_applied = invoke_no_param(
                     controller,
-                    STR("SetInputModeUIOnly"),
-                    STR("/Script/Engine.PlayerController:SetInputModeUIOnly"));
+                    STR("SetInputModeGameAndUI"),
+                    STR("/Script/Engine.PlayerController:SetInputModeGameAndUI"));
+                if (input_mode_applied)
+                {
+                    applied_mode_name = "GameAndUI";
+                }
             }
         }
         else
@@ -4868,6 +4884,10 @@ namespace WindroseTextSigns
                 controller,
                 STR("SetInputModeGameOnly"),
                 STR("/Script/Engine.PlayerController:SetInputModeGameOnly"));
+            if (input_mode_applied)
+            {
+                applied_mode_name = "GameOnly";
+            }
         }
 
         const bool cursor_set = set_bool_property_if_present(controller, "bshowmousecursor", enable_ui_mode);
@@ -4876,6 +4896,7 @@ namespace WindroseTextSigns
         m_phase7_keyboard_capture_active.store(false);
         log_line("[phase7-umg] input_capture enable=" + std::string{enable_ui_mode ? "true" : "false"} +
                  " inputMode=" + std::string{input_mode_applied ? "true" : "false"} +
+                 " appliedMode=" + applied_mode_name +
                  " cursor=" + std::string{cursor_set ? "true" : "false"} +
                  " ignoreLook=" + std::string{look_ignored ? "true" : "false"} +
                  " ignoreMove=" + std::string{move_ignored ? "true" : "false"} +
@@ -5208,7 +5229,13 @@ namespace WindroseTextSigns
 
         const bool root_set = set_object_property_if_present(tree, "RootWidget", root);
         const bool title_text = invoke_umg_set_text(title, "Sign Text");
-        const bool hint_text = invoke_umg_set_text(hint, "Enter  Apply\nShift+Enter  New line\nEsc  Cancel");
+        // Show the configured hotkey as the canonical close key. On builds where
+        // SetInputModeUIOnly is unavailable (Windrose UE5.6) Esc still works but also
+        // opens the game's pause menu, so steering users to the hotkey-toggle path is
+        // the better UX. The hotkey-name comes from the INI (WTS_HOTKEY=...).
+        const std::string hint_message =
+            "Enter  Apply\nShift+Enter  New line\n" + m_hotkey_name + "  Cancel";
+        const bool hint_text = invoke_umg_set_text(hint, hint_message.c_str());
         const bool input_text = invoke_umg_set_text(text_box, "");
         const bool title_color =
             invoke_set_rgba_value(title, STR("SetColorAndOpacity"), nullptr, 0.91f, 0.88f, 0.81f, 1.0f) ||
@@ -5748,23 +5775,24 @@ namespace WindroseTextSigns
             !shift_down &&
             count_line_breaks(live_text) > count_line_breaks(m_phase7_umg_last_text);
         const bool explicit_enter_intent = enter_requested || enter_edge || enter_pressed_since_poll;
-        const bool apply_pressed = explicit_enter_intent && !shift_down;
+        // On some builds (Windrose UE5.6 in particular) the EditableTextBox consumes the
+        // Enter key to insert a newline character before our UE4SS register_keydown_event hook
+        // or GetAsyncKeyState see the press. The user-visible symptom is "I have to press
+        // Enter several times before Apply triggers" (Ageous noted this on the Nexus posts
+        // thread: "the game still captures them first"). When an unshifted newline appears
+        // in the text without an explicit-enter signal, treat that as the implicit apply
+        // intent - the user pressed Enter, Shift was not held, README contract says that's
+        // apply, and apply_text_to_selected_label already strips the trailing newline.
+        const bool implicit_enter_via_newline = unshifted_newline_added && !shift_down;
+        const bool apply_pressed = (explicit_enter_intent && !shift_down) || implicit_enter_via_newline;
         const bool cancel_pressed = escape_requested || escape_edge;
-        if (enter_requested || escape_requested || enter_edge || escape_edge || enter_pressed_since_poll || escape_pressed_since_poll)
+        if (enter_requested || escape_requested || enter_edge || escape_edge || enter_pressed_since_poll || escape_pressed_since_poll || implicit_enter_via_newline)
         {
             m_phase7_last_interaction_at = now;
         }
 
         if (!apply_pressed && !cancel_pressed)
         {
-            if (unshifted_newline_added && !explicit_enter_intent && !shift_down)
-            {
-                log_line("[phase7-umg] apply_blocked reason=no_explicit_enter enterRequested=" +
-                         std::string{enter_requested ? "true" : "false"} +
-                         " enterEdge=" + std::string{enter_edge ? "true" : "false"} +
-                         " enterAsync=" + std::string{enter_pressed_since_poll ? "true" : "false"} +
-                         " newlineApply=" + std::string{unshifted_newline_added ? "true" : "false"});
-            }
             if (live_read)
             {
                 m_phase7_umg_last_text = live_text;
@@ -7152,8 +7180,40 @@ namespace WindroseTextSigns
         const auto now = std::chrono::steady_clock::now();
         if (new_request)
         {
+            // Toggle-close: if the editor is already visible / active, treat the hotkey
+            // press as a close request and skip the open-retry sequence. This gives users
+            // a non-Esc way to dismiss the editor on builds where SetInputModeUIOnly is not
+            // exposed as a UFunction (Windrose UE5.6 - native_ui_probe reports
+            // inputGameAndUI=0 / inputGameOnly=0), so Esc cannot be suppressed and leaks
+            // to the game's pause menu binding. We deliberately don't check
+            // m_phase7_umg_widget here - that pointer is cached at prewarm and never reset
+            // to null on close, so it is not a useful "is the editor currently visible"
+            // indicator.
+            const bool editor_is_open = m_phase7_active_epoch != 0 ||
+                                        m_phase7_umg_in_viewport ||
+                                        m_phase7_native_editor_open ||
+                                        m_phase7_ui_input_mode_active ||
+                                        m_ui_open;
+            log_line(std::string{"[input] hotkey edge editorOpen="} +
+                     (editor_is_open ? "true" : "false") +
+                     " activeEpoch=" + std::to_string(m_phase7_active_epoch) +
+                     " umgInViewport=" + (m_phase7_umg_in_viewport ? "true" : "false") +
+                     " nativeOpen=" + (m_phase7_native_editor_open ? "true" : "false") +
+                     " uiInputActive=" + (m_phase7_ui_input_mode_active ? "true" : "false") +
+                     " uiOpen=" + (m_ui_open ? "true" : "false"));
+            if (editor_is_open)
+            {
+                m_phase7_escape_requested.store(true);
+                m_hotkey_retry_remaining = 0;
+                return;
+            }
+
             // One keypress should survive transient viewpoint/controller hiccups.
-            m_hotkey_retry_remaining = 8;
+            // 25 attempts at 60ms gives a ~1.5s window. The previous 8-attempt budget
+            // (~480ms) was too tight on machines with slow F8 latency: users reported
+            // having to press F8 multiple times because the controller/camera resolve
+            // didn't finish inside the retry window.
+            m_hotkey_retry_remaining = 25;
             m_hotkey_retry_next = now;
             if (m_f8_latency_breakdown_enabled && !m_f8_latency_trace.active)
             {
@@ -10907,6 +10967,28 @@ namespace WindroseTextSigns
         }
         if (!is_confirmed_label_text_kind(found->second.kind))
         {
+            return;
+        }
+        // Top-level destroy guard: if a destroy-construct correlation was observed for this
+        // slot within the destroy-confirm TTL, do not restore the cached text onto the rebuilt
+        // actor. Previously this check only ran inside the create-null retry branch, so a fresh
+        // actor (no retry-state) could pick up stale m_labels[key] and the user would see the
+        // previous sign's text reappear on a newly built sign within ~10 seconds (the workaround
+        // documented in README's "Wait 5-10 seconds before rebuilding").
+        // Pending create-null retry for this key is also canceled here, mirroring the existing
+        // retry-side guard so we don't keep trying to attach a stale text after the slot was
+        // destroyed.
+        if (has_recent_destroy_confirmation(stable_id, actor_world_id))
+        {
+            if (auto create_retry = m_create_null_retry_states.find(key);
+                create_retry != m_create_null_retry_states.end())
+            {
+                log_line("[apply-retry] blocked key=" + key + " reason=trusted_destroy_top_guard");
+                m_create_null_retry_states.erase(create_retry);
+            }
+            log_line("[save] restore_blocked_recent_destroy key=" + key +
+                     " stableId=" + stable_id +
+                     " worldId=" + actor_world_id);
             return;
         }
         const auto log_restore_skip_guard = [&](const std::string& reason, const std::chrono::milliseconds remaining) {
