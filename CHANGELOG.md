@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.12
+- Improved automatic dedicated-server connection discovery, especially for LAN servers where the game exposes server addresses through connection negotiation logs.
+- Reduced false multiplayer network errors caused by the client not finding the server bridge address automatically.
+
 ## 0.1.11
 - Improved multiplayer connection reliability, especially for dedicated servers and higher-latency networks.
 - Improved session/log handling so old lobby/session signals are less likely to affect a new session.
