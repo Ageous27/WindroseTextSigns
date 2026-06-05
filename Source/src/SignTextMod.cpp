@@ -1014,6 +1014,164 @@ namespace
         std::string source{};
     };
 
+    auto collect_route_hosts_from_log_window(
+        const std::filesystem::path& log_path,
+        const uintmax_t window_start_offset) -> std::vector<std::pair<std::string, std::string>>
+    {
+        std::vector<std::pair<std::string, std::string>> out{};
+        if (log_path.empty())
+        {
+            return out;
+        }
+
+        std::error_code ec{};
+        const auto file_size = std::filesystem::file_size(log_path, ec);
+        if (ec || file_size == 0)
+        {
+            return out;
+        }
+
+        const uintmax_t start_offset = std::min<uintmax_t>(window_start_offset, file_size);
+        if (start_offset >= file_size)
+        {
+            return out;
+        }
+
+        std::ifstream input{log_path, std::ios::binary};
+        if (!input.is_open())
+        {
+            return out;
+        }
+
+        input.seekg(static_cast<std::streamoff>(start_offset), std::ios::beg);
+        if (!input.good())
+        {
+            return out;
+        }
+
+        std::string content{};
+        constexpr size_t k_max_read_bytes = 8 * 1024 * 1024;
+        content.reserve(k_max_read_bytes);
+
+        std::array<char, 64 * 1024> buffer{};
+        while (input.good() && content.size() < k_max_read_bytes)
+        {
+            const auto remaining = k_max_read_bytes - content.size();
+            const auto chunk_size = static_cast<std::streamsize>(std::min<size_t>(buffer.size(), remaining));
+            input.read(buffer.data(), chunk_size);
+            const auto got = input.gcount();
+            if (got <= 0)
+            {
+                break;
+            }
+            content.append(buffer.data(), static_cast<size_t>(got));
+        }
+
+        if (content.empty())
+        {
+            return out;
+        }
+
+        auto append_candidate = [&](const std::string& host, const std::string& source) {
+            if (!parse_ipv4_octets(host).has_value())
+            {
+                return;
+            }
+            for (const auto& existing : out)
+            {
+                if (existing.first == host)
+                {
+                    return;
+                }
+            }
+            out.emplace_back(host, source);
+        };
+
+        static const std::regex ice_candidate_rx{
+            R"(\b(?:UDP|TCP)\s+([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]+)\s+[A-Fa-f0-9]+\s+\d+\s+(host|srflx)\b)",
+            std::regex::icase};
+        static const std::regex direct_server_address_rx{
+            R"(Start direct connection to server\.\s*ServerAddress\s+([0-9]{1,3}(?:\.[0-9]{1,3}){3}))",
+            std::regex::icase};
+        static const std::regex coop_serverurl_endpoint_rx{
+            R"(\bCoop server connected.*ServerUrl\s*'([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]+)')",
+            std::regex::icase};
+        static const std::regex browse_endpoint_rx{
+            R"(\bBrowse:\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]+)\b)",
+            std::regex::icase};
+        static const std::regex loadmap_endpoint_rx{
+            R"(\bLoadMap:\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]+)\b)",
+            std::regex::icase};
+        static const std::regex remoteaddr_endpoint_rx{
+            R"(\bRemoteAddr:\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]+)\b)",
+            std::regex::icase};
+        static const std::regex remote_address_rx{
+            R"(\bRemoteAddress:\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]+)\b)",
+            std::regex::icase};
+
+        std::istringstream lines{content};
+        std::string line{};
+        std::smatch match{};
+        while (std::getline(lines, line))
+        {
+            const bool remote_ice_line =
+                line.find("SetRemoteIceData") != std::string::npos ||
+                line.find("Added remote candidates") != std::string::npos;
+            if (remote_ice_line)
+            {
+                for (auto it = std::sregex_iterator(line.begin(), line.end(), ice_candidate_rx);
+                     it != std::sregex_iterator{};
+                     ++it)
+                {
+                    if (it->size() < 4)
+                    {
+                        continue;
+                    }
+                    const auto ip = (*it)[1].str();
+                    auto type = (*it)[3].str();
+                    std::transform(type.begin(), type.end(), type.begin(), [](unsigned char c) {
+                        return static_cast<char>(std::tolower(c));
+                    });
+                    if (type == "host")
+                    {
+                        append_candidate(ip, "ice_remote_host");
+                    }
+                    else if (type == "srflx" && is_public_ipv4(ip))
+                    {
+                        append_candidate(ip, "ice_remote_srflx");
+                    }
+                }
+            }
+
+            if (std::regex_search(line, match, direct_server_address_rx) && match.size() >= 2)
+            {
+                append_candidate(match[1].str(), "start_direct_connection");
+            }
+            if (std::regex_search(line, match, coop_serverurl_endpoint_rx) && match.size() >= 2)
+            {
+                append_candidate(match[1].str(), "coop_serverurl");
+            }
+            if (std::regex_search(line, match, browse_endpoint_rx) && match.size() >= 2)
+            {
+                append_candidate(match[1].str(), "browse_endpoint");
+            }
+            if (std::regex_search(line, match, loadmap_endpoint_rx) && match.size() >= 2)
+            {
+                append_candidate(match[1].str(), "loadmap_endpoint");
+            }
+            if (std::regex_search(line, match, remoteaddr_endpoint_rx) && match.size() >= 2)
+            {
+                append_candidate(match[1].str(), "remoteaddr_endpoint");
+            }
+            if (std::regex_search(line, match, remote_address_rx) && match.size() >= 2)
+            {
+                append_candidate(match[1].str(), "remote_address");
+            }
+        }
+
+        return out;
+    }
+
     auto try_latest_definitive_route_endpoint_from_log_window(
         const std::filesystem::path& log_path,
         const uintmax_t window_start_offset) -> std::optional<RouteEndpoint>
@@ -6178,20 +6336,8 @@ namespace WindroseTextSigns
 
     auto SignTextMod::set_phase7_game_and_ui_input_mode(bool enable_ui_mode) -> bool
     {
-        // BEGIN TEMP PHASE7 TIMING BREAKDOWN
-        // Remove this block and the [phase7-timing] log when Phase 7 input timing is no longer needed.
-        const auto phase7_input_timing_start = std::chrono::steady_clock::now();
-        auto phase7_input_timing_ms = [](std::chrono::steady_clock::time_point begin,
-                                         std::chrono::steady_clock::time_point end) -> long long {
-            return std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count();
-        };
-        // END TEMP PHASE7 TIMING BREAKDOWN
-
         if (m_phase7_ui_input_mode_active == enable_ui_mode)
         {
-            // BEGIN TEMP PHASE7 TIMING BREAKDOWN
-            const auto phase7_cached_focus_begin = std::chrono::steady_clock::now();
-            // END TEMP PHASE7 TIMING BREAKDOWN
             if (enable_ui_mode)
             {
                 install_phase7_keyboard_capture_hook();
@@ -6204,37 +6350,14 @@ namespace WindroseTextSigns
                 m_phase7_mouse_first_down_consumed.store(false);
                 m_phase7_force_full_mouse_consume.store(false);
             }
-            // BEGIN TEMP PHASE7 TIMING BREAKDOWN
-            const auto phase7_cached_focus_end = std::chrono::steady_clock::now();
-            log_line("[phase7-timing] input_mode_breakdown enable=" + std::string{enable_ui_mode ? "true" : "false"} +
-                     " cached=true controllerLookupMs=0 functionLookupMs=0 setInputModeUiOnlyCallMs=0 setInputModeGameAndUiCallMs=0 setInputModeGameOnlyCallMs=0 cursorFlagMs=0 ignoreLookMoveMs=0 focusPrepMs=" +
-                     std::to_string(phase7_input_timing_ms(phase7_cached_focus_begin, phase7_cached_focus_end)) +
-                     " totalMs=" + std::to_string(phase7_input_timing_ms(phase7_input_timing_start, phase7_cached_focus_end)));
-            // END TEMP PHASE7 TIMING BREAKDOWN
             return true;
         }
-        // BEGIN TEMP PHASE7 TIMING BREAKDOWN
-        const auto phase7_controller_lookup_begin = std::chrono::steady_clock::now();
-        // END TEMP PHASE7 TIMING BREAKDOWN
         auto* controller = try_get_primary_player_controller();
-        // BEGIN TEMP PHASE7 TIMING BREAKDOWN
-        const auto phase7_controller_lookup_end = std::chrono::steady_clock::now();
-        // END TEMP PHASE7 TIMING BREAKDOWN
         if (!controller)
         {
-            // BEGIN TEMP PHASE7 TIMING BREAKDOWN
-            log_line("[phase7-timing] input_mode_breakdown enable=" + std::string{enable_ui_mode ? "true" : "false"} +
-                     " cached=false controllerLookupMs=" +
-                     std::to_string(phase7_input_timing_ms(phase7_controller_lookup_begin, phase7_controller_lookup_end)) +
-                     " functionLookupMs=0 setInputModeUiOnlyCallMs=0 setInputModeGameAndUiCallMs=0 setInputModeGameOnlyCallMs=0 cursorFlagMs=0 ignoreLookMoveMs=0 focusPrepMs=0 totalMs=" +
-                     std::to_string(phase7_input_timing_ms(phase7_input_timing_start, phase7_controller_lookup_end)) +
-                     " result=no_controller");
-            // END TEMP PHASE7 TIMING BREAKDOWN
             return false;
         }
 
-        // BEGIN TEMP PHASE7 TIMING BREAKDOWN
-        const auto phase7_function_lookup_begin = std::chrono::steady_clock::now();
         const auto controller_class_key = [&]() -> std::string {
             if (controller->GetClassPrivate())
             {
@@ -6271,11 +6394,6 @@ namespace WindroseTextSigns
                 STR("/Script/Engine.Controller:SetIgnoreMoveInput"));
             phase7_input_cache_refreshed = true;
         }
-        const auto phase7_function_lookup_end = std::chrono::steady_clock::now();
-        long long phase7_ui_only_call_ms = 0;
-        long long phase7_game_and_ui_call_ms = 0;
-        long long phase7_game_only_call_ms = 0;
-        // END TEMP PHASE7 TIMING BREAKDOWN
 
         bool input_mode_applied = false;
         std::string applied_mode_name = "none";
@@ -6283,28 +6401,14 @@ namespace WindroseTextSigns
         {
             // Prefer UIOnly so mouse clicks stay owned by the editor widget and do not
             // pass through to gameplay bindings underneath.
-            // BEGIN TEMP PHASE7 TIMING BREAKDOWN
-            const auto phase7_ui_only_call_begin = std::chrono::steady_clock::now();
-            // END TEMP PHASE7 TIMING BREAKDOWN
             input_mode_applied = invoke_no_param_cached(controller, m_phase7_input_mode_fn_cache.set_input_mode_ui_only);
-            // BEGIN TEMP PHASE7 TIMING BREAKDOWN
-            const auto phase7_ui_only_call_end = std::chrono::steady_clock::now();
-            phase7_ui_only_call_ms = phase7_input_timing_ms(phase7_ui_only_call_begin, phase7_ui_only_call_end);
-            // END TEMP PHASE7 TIMING BREAKDOWN
             if (input_mode_applied)
             {
                 applied_mode_name = "UIOnly";
             }
             else
             {
-                // BEGIN TEMP PHASE7 TIMING BREAKDOWN
-                const auto phase7_game_and_ui_call_begin = std::chrono::steady_clock::now();
-                // END TEMP PHASE7 TIMING BREAKDOWN
                 input_mode_applied = invoke_no_param_cached(controller, m_phase7_input_mode_fn_cache.set_input_mode_game_and_ui);
-                // BEGIN TEMP PHASE7 TIMING BREAKDOWN
-                const auto phase7_game_and_ui_call_end = std::chrono::steady_clock::now();
-                phase7_game_and_ui_call_ms = phase7_input_timing_ms(phase7_game_and_ui_call_begin, phase7_game_and_ui_call_end);
-                // END TEMP PHASE7 TIMING BREAKDOWN
                 if (input_mode_applied)
                 {
                     applied_mode_name = "GameAndUI";
@@ -6313,34 +6417,16 @@ namespace WindroseTextSigns
         }
         else
         {
-            // BEGIN TEMP PHASE7 TIMING BREAKDOWN
-            const auto phase7_game_only_call_begin = std::chrono::steady_clock::now();
-            // END TEMP PHASE7 TIMING BREAKDOWN
             input_mode_applied = invoke_no_param_cached(controller, m_phase7_input_mode_fn_cache.set_input_mode_game_only);
-            // BEGIN TEMP PHASE7 TIMING BREAKDOWN
-            const auto phase7_game_only_call_end = std::chrono::steady_clock::now();
-            phase7_game_only_call_ms = phase7_input_timing_ms(phase7_game_only_call_begin, phase7_game_only_call_end);
-            // END TEMP PHASE7 TIMING BREAKDOWN
             if (input_mode_applied)
             {
                 applied_mode_name = "GameOnly";
             }
         }
 
-        // BEGIN TEMP PHASE7 TIMING BREAKDOWN
-        const auto phase7_cursor_flag_begin = std::chrono::steady_clock::now();
-        // END TEMP PHASE7 TIMING BREAKDOWN
         const bool cursor_set = set_bool_property_if_present(controller, "bshowmousecursor", enable_ui_mode);
-        // BEGIN TEMP PHASE7 TIMING BREAKDOWN
-        const auto phase7_cursor_flag_end = std::chrono::steady_clock::now();
-        const auto phase7_ignore_look_move_begin = std::chrono::steady_clock::now();
-        // END TEMP PHASE7 TIMING BREAKDOWN
         const bool look_ignored = invoke_with_bool_param_cached(controller, m_phase7_input_mode_fn_cache.set_ignore_look_input, enable_ui_mode);
         const bool move_ignored = invoke_with_bool_param_cached(controller, m_phase7_input_mode_fn_cache.set_ignore_move_input, enable_ui_mode);
-        // BEGIN TEMP PHASE7 TIMING BREAKDOWN
-        const auto phase7_ignore_look_move_end = std::chrono::steady_clock::now();
-        const auto phase7_focus_prep_begin = std::chrono::steady_clock::now();
-        // END TEMP PHASE7 TIMING BREAKDOWN
 
         if (enable_ui_mode)
         {
@@ -6365,9 +6451,6 @@ namespace WindroseTextSigns
             m_phase7_mouse_first_down_consumed.store(false);
             m_phase7_force_full_mouse_consume.store(false);
         }
-        // BEGIN TEMP PHASE7 TIMING BREAKDOWN
-        const auto phase7_focus_prep_end = std::chrono::steady_clock::now();
-        // END TEMP PHASE7 TIMING BREAKDOWN
 
         const bool ll_hook_installed = m_phase7_keyboard_hook_installed.load(std::memory_order_relaxed);
         const bool ll_hook_active = enable_ui_mode && ll_hook_installed;
@@ -6393,30 +6476,8 @@ namespace WindroseTextSigns
                      " gameAndUI=" + std::string{m_phase7_input_mode_fn_cache.set_input_mode_game_and_ui ? "true" : "false"} +
                      " gameOnly=" + std::string{m_phase7_input_mode_fn_cache.set_input_mode_game_only ? "true" : "false"} +
                      " ignoreLook=" + std::string{m_phase7_input_mode_fn_cache.set_ignore_look_input ? "true" : "false"} +
-                     " ignoreMove=" + std::string{m_phase7_input_mode_fn_cache.set_ignore_move_input ? "true" : "false"} +
-                     " lookupMs=" + std::to_string(phase7_input_timing_ms(phase7_function_lookup_begin, phase7_function_lookup_end)));
+                     " ignoreMove=" + std::string{m_phase7_input_mode_fn_cache.set_ignore_move_input ? "true" : "false"});
         }
-        // BEGIN TEMP PHASE7 TIMING BREAKDOWN
-        const auto phase7_input_timing_end = std::chrono::steady_clock::now();
-        log_line("[phase7-timing] input_mode_breakdown enable=" + std::string{enable_ui_mode ? "true" : "false"} +
-                 " cached=false controllerLookupMs=" +
-                 std::to_string(phase7_input_timing_ms(phase7_controller_lookup_begin, phase7_controller_lookup_end)) +
-                 " inputFunctionCache=" + std::string{phase7_input_cache_refreshed ? "refreshed" : "reused"} +
-                 " functionLookupMs=" +
-                 std::to_string(phase7_input_timing_ms(phase7_function_lookup_begin, phase7_function_lookup_end)) +
-                 " setInputModeUiOnlyCallMs=" + std::to_string(phase7_ui_only_call_ms) +
-                 " setInputModeGameAndUiCallMs=" + std::to_string(phase7_game_and_ui_call_ms) +
-                 " setInputModeGameOnlyCallMs=" + std::to_string(phase7_game_only_call_ms) +
-                 " cursorFlagMs=" +
-                 std::to_string(phase7_input_timing_ms(phase7_cursor_flag_begin, phase7_cursor_flag_end)) +
-                 " ignoreLookMoveMs=" +
-                 std::to_string(phase7_input_timing_ms(phase7_ignore_look_move_begin, phase7_ignore_look_move_end)) +
-                 " focusPrepMs=" +
-                 std::to_string(phase7_input_timing_ms(phase7_focus_prep_begin, phase7_focus_prep_end)) +
-                 " totalMs=" + std::to_string(phase7_input_timing_ms(phase7_input_timing_start, phase7_input_timing_end)) +
-                 " appliedMode=" + applied_mode_name +
-                 " result=" + std::string{applied ? "applied" : "not_applied"});
-        // END TEMP PHASE7 TIMING BREAKDOWN
         return applied;
     }
 
@@ -13696,6 +13757,70 @@ namespace WindroseTextSigns
                 remoteaddr_host.has_value())
             {
                 add_candidate(*remoteaddr_host, "window:remoteaddr_endpoint");
+            }
+            const auto window_candidates =
+                collect_route_hosts_from_log_window(authority_log_path, authority_window_start);
+            for (const auto& candidate : window_candidates)
+            {
+                const auto& host = candidate.first;
+                const auto& source = candidate.second;
+                if (host == "127.0.0.1")
+                {
+                    continue;
+                }
+                if (is_private_ipv4(host))
+                {
+                    add_candidate(host, "window:" + source);
+                    if (m_bridge_route_fallback_candidates_logged.insert("window:" + host + ":" + source).second)
+                    {
+                        log_line("[bridge-route] window_candidate host=" + host +
+                                 " source=" + source +
+                                 " epoch=" + std::to_string(m_session_epoch));
+                    }
+                }
+            }
+            for (const auto& candidate : window_candidates)
+            {
+                const auto& host = candidate.first;
+                const auto& source = candidate.second;
+                if (host == "127.0.0.1")
+                {
+                    continue;
+                }
+                if (is_public_ipv4(host))
+                {
+                    add_candidate(host, "window:" + source);
+                    if (m_bridge_route_fallback_candidates_logged.insert("window:" + host + ":" + source).second)
+                    {
+                        log_line("[bridge-route] window_candidate host=" + host +
+                                 " source=" + source +
+                                 " epoch=" + std::to_string(m_session_epoch));
+                    }
+                }
+            }
+            bool loopback_window_candidate_seen = false;
+            for (const auto& candidate : window_candidates)
+            {
+                if (candidate.first == "127.0.0.1")
+                {
+                    loopback_window_candidate_seen = true;
+                    break;
+                }
+            }
+            if (loopback_window_candidate_seen && has_local_windrose_and_server_process_evidence() && !m_bridge_route_force_non_loopback)
+            {
+                add_candidate("127.0.0.1", "window:loopback_same_machine");
+            }
+            if (candidates.empty() && window_candidates.empty())
+            {
+                const std::string empty_key =
+                    "window_empty:" + std::to_string(m_session_epoch) + ":" + std::to_string(authority_window_start);
+                if (m_bridge_route_rejected_candidates_logged.insert(empty_key).second)
+                {
+                    log_line("[bridge-route] window_candidates_empty epoch=" + std::to_string(m_session_epoch) +
+                             " windowStart=" + std::to_string(authority_window_start) +
+                             " logPath=" + (authority_log_path.empty() ? "unknown" : authority_log_path.string()));
+                }
             }
             return candidates;
         }
